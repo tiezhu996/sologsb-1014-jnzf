@@ -53,6 +53,17 @@ function download(name: string, content: string, mime: string): void {
   URL.revokeObjectURL(link.href);
 }
 
+function exportProof(format: 'markdown' | 'latex', document: ProofDocument): void {
+  // 结构错误（引用失序、依据断点等）未修好前一律拦住，不导出带断点的稿子。
+  const errors = store.checks.filter((check) => check.severity === 'error');
+  if (errors.length) {
+    store.notify(`还有 ${errors.length} 个结构错误，修好后才能导出（已在检查结果中点名）`);
+    return;
+  }
+  if (format === 'markdown') download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8');
+  else download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8');
+}
+
 function exportMarkdown(document: ProofDocument): string {
   const lines = [`# ${document.title}`, '', `**证明目标：** $${document.goal}$`, ''];
   document.steps.forEach((step, index) => {
@@ -156,7 +167,7 @@ export class ProofApp implements Component {
         ]),
         m('div.topbar-center', [
           m('span.status-dot', { class: errors ? 'has-error' : 'is-ok' }),
-          errors ? `${errors} 个结构错误` : '证明结构可检查',
+          errors ? `${errors} 个结构错误` : '结构完整，可导出',
           m('span.topbar-separator'),
           `自动保存于 ${new Date(document.updatedAt).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`,
         ]),
@@ -199,7 +210,7 @@ export class ProofApp implements Component {
             m('div.check-summary-bars', [
               m('span', { style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
             ]),
-            m('p', errors ? '修正错误后再保存为定稿。' : warnings ? '结构有效，仍有待核对项。' : '当前结构与引用关系完整。'),
+            m('p', errors ? '先修复被点名的断点，修复后才能导出。' : warnings ? '结构有效，仍有待核对项。' : '引用先后与结论依据链均完整。'),
           ]),
         ]),
         m('section.editor-column', [
@@ -209,8 +220,19 @@ export class ProofApp implements Component {
               m('div.editor-meta', [`${document.author} · ${document.steps.length} 个步骤`, m('span.keyboard-hint', '拖动 ⠿ 排序')]),
             ]),
             m('div.export-actions', [
-              m('button.button.is-small', { onclick: () => download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8') }, '导出 Markdown'),
-              m('button.button.is-small', { onclick: () => download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8') }, '导出 LaTeX'),
+              errors > 0 && m('span.export-blocked', `⛔ 有 ${errors} 个结构错误，导出已拦截`),
+              m('button.button.is-small', {
+                class: errors ? 'is-static' : '',
+                disabled: !!errors,
+                title: errors ? '修复引用失序或依据断点后才能导出' : '导出 Markdown 证明稿',
+                onclick: () => exportProof('markdown', document),
+              }, '导出 Markdown'),
+              m('button.button.is-small', {
+                class: errors ? 'is-static' : '',
+                disabled: !!errors,
+                title: errors ? '修复引用失序或依据断点后才能导出' : '导出 LaTeX 证明稿',
+                onclick: () => exportProof('latex', document),
+              }, '导出 LaTeX'),
             ]),
           ]),
           m('section.goal-card', [
@@ -256,10 +278,21 @@ export class ProofApp implements Component {
                 ]),
                 m('div.step-statement', renderRichText(step.statement)),
                 m('div.step-footer', [
-                  m('span', step.references.length ? `依据：${step.references.map((reference) => {
-                    const referenceIndex = document.steps.findIndex((item) => item.id === reference);
-                    return referenceIndex >= 0 ? `步骤 ${referenceIndex + 1}` : `缺失 ${shortId(reference)}`;
-                  }).join('、')}` : '独立前提'),
+                  m('span', step.references.length ? (() => {
+                    const parts: m.Children = ['依据：'];
+                    step.references.forEach((reference, referencePosition) => {
+                      if (referencePosition > 0) parts.push('、');
+                      const referenceIndex = document.steps.findIndex((item) => item.id === reference);
+                      if (referenceIndex < 0) {
+                        parts.push(m('span.ref-bad', { key: referencePosition }, `缺失 ${shortId(reference)}`));
+                      } else if (referenceIndex > index) {
+                        parts.push(m('span.ref-forward', { key: referencePosition }, `步骤 ${referenceIndex + 1}（在后）`));
+                      } else {
+                        parts.push(`步骤 ${referenceIndex + 1}`);
+                      }
+                    });
+                    return parts;
+                  })() : '独立前提'),
                   step.note && m('span.has-note', '含旁注'),
                   step.counterexample && m('span.has-counterexample', '含反例'),
                   step.alternative && m('span.has-branch', '含替代分支'),
@@ -300,20 +333,30 @@ export class ProofApp implements Component {
                 m.redraw();
               },
             }, snippet.label))),
-            m('label.field-label', '引用步骤'),
-            m('div.reference-list', document.steps.filter((step) => step.id !== selected.id).map((step) => m('label.reference-item', [
-              m('input', {
-                type: 'checkbox',
-                checked: selected.references.includes(step.id),
-                onchange: (event: Event) => {
-                  const checked = (event.target as HTMLInputElement).checked;
-                  const references = checked ? [...selected.references, step.id] : selected.references.filter((id) => id !== step.id);
-                  store.updateStep({ references });
-                },
-              }),
-              m('span', `步骤 ${document.steps.indexOf(step) + 1}`),
-              m('small', step.statement.replace(/\$/g, '')),
-            ]))),
+            m('label.field-label', '引用步骤（仅限排在前面的步骤）'),
+            m('div.reference-list', document.steps.filter((step) => step.id !== selected.id).map((step) => {
+              const stepIndex = document.steps.indexOf(step);
+              const selectedIndex = document.steps.findIndex((item) => item.id === selected.id);
+              const isChecked = selected.references.includes(step.id);
+              const isForward = stepIndex > selectedIndex;
+              return m('label.reference-item', { class: isForward ? 'is-forward' : '', title: isForward ? '只能引用排在前面的步骤' : '' }, [
+                m('input', {
+                  type: 'checkbox',
+                  checked: isChecked,
+                  // 排在后面的步骤不允许新勾选；若拖拽后已存在该失效引用，则允许取消它。
+                  disabled: isForward && !isChecked,
+                  onchange: (event: Event) => {
+                    const checked = (event.target as HTMLInputElement).checked;
+                    const references = checked ? [...selected.references, step.id] : selected.references.filter((id) => id !== step.id);
+                    store.updateStep({ references });
+                  },
+                }),
+                m('span', `步骤 ${stepIndex + 1}${isForward ? ' · 在后' : ''}`),
+                m('small', step.statement.replace(/\$/g, '')),
+              ]);
+            })),
+            selected.references.some((id) => (document.steps.findIndex((item) => item.id === id)) > (document.steps.findIndex((item) => item.id === selected.id))) &&
+              m('p.reference-hint', '该步骤引用了排在后面的步骤，取消这些“在后”引用或把本步拖到它们之后。'),
             m('div.field-grid', [
               m('div', [m('label.field-label', '旁注'), m('textarea.textarea.is-small', { rows: 2, value: selected.note, placeholder: '记录思路或条件', oninput: (event: Event) => store.updateStep({ note: (event.target as HTMLTextAreaElement).value }) })]),
               m('div', [m('label.field-label', '反例 / 边界情况'), m('textarea.textarea.is-small', { rows: 2, value: selected.counterexample, placeholder: '尝试寻找反例', oninput: (event: Event) => store.updateStep({ counterexample: (event.target as HTMLTextAreaElement).value }) })]),
