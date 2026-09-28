@@ -199,7 +199,7 @@ export class ProofApp implements Component {
             m('div.check-summary-bars', [
               m('span', { style: { width: `${Math.max(8, 100 - errors * 24 - warnings * 12)}%` } }),
             ]),
-            m('p', errors ? '修正错误后再保存为定稿。' : warnings ? '结构有效，仍有待核对项。' : '当前结构与引用关系完整。'),
+            m('p', errors ? '存在结构错误，修复前无法导出定稿。' : warnings ? '结构有效，仍有待核对项。' : '引用先后正确，结论可回溯到前提。'),
           ]),
         ]),
         m('section.editor-column', [
@@ -209,8 +209,29 @@ export class ProofApp implements Component {
               m('div.editor-meta', [`${document.author} · ${document.steps.length} 个步骤`, m('span.keyboard-hint', '拖动 ⠿ 排序')]),
             ]),
             m('div.export-actions', [
-              m('button.button.is-small', { onclick: () => download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8') }, '导出 Markdown'),
-              m('button.button.is-small', { onclick: () => download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8') }, '导出 LaTeX'),
+              m('button.button.is-small', {
+                disabled: errors > 0,
+                title: errors ? '存在结构错误，修复后才能导出' : '导出为 Markdown',
+                onclick: () => {
+                  if (errors > 0) {
+                    store.notify('引用或依据链存在断点，请先修复检查区点名的步骤再导出');
+                    return;
+                  }
+                  download(`${document.title}.md`, exportMarkdown(document), 'text/markdown;charset=utf-8');
+                },
+              }, '导出 Markdown'),
+              m('button.button.is-small', {
+                disabled: errors > 0,
+                title: errors ? '存在结构错误，修复后才能导出' : '导出为 LaTeX',
+                onclick: () => {
+                  if (errors > 0) {
+                    store.notify('引用或依据链存在断点，请先修复检查区点名的步骤再导出');
+                    return;
+                  }
+                  download(`${document.title}.tex`, exportLatex(document), 'application/x-tex;charset=utf-8');
+                },
+              }, '导出 LaTeX'),
+              errors > 0 && m('span.export-blocked-hint', '存在结构错误，修复后可导出'),
             ]),
           ]),
           m('section.goal-card', [

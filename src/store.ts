@@ -1,5 +1,5 @@
 import { redraw } from 'mithril';
-import type { ProofCheck, ProofDocument, ProofStep, ProofVersion } from './types';
+import type { ProofCheck, ProofDocument, ProofStep, ProofVersion, StepType } from './types';
 
 const STORAGE_KEY = 'sologsb-1014-proof-workspace-v1';
 const uid = (prefix: string) => `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -52,12 +52,68 @@ function initialDocuments(): ProofDocument[] {
   ];
 }
 
+function asText(value: unknown, fallback = ''): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+// 兼容旧稿：早期保存的数据可能缺少后来新增的字段，逐字段补齐后仍可正常打开。
+function normalizeStep(raw: unknown): ProofStep | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const data = raw as Record<string, unknown>;
+  const type: StepType = data.type === 'derivation' || data.type === 'goal' ? data.type : 'premise';
+  const references = Array.isArray(data.references) ? data.references.filter((id): id is string => typeof id === 'string') : [];
+  return {
+    id: asText(data.id) || uid('step'),
+    type,
+    statement: asText(data.statement),
+    rule: asText(data.rule, type === 'premise' ? '前提' : type === 'goal' ? '结论' : '等式变形'),
+    references,
+    note: asText(data.note),
+    counterexample: asText(data.counterexample),
+    alternative: asText(data.alternative),
+  };
+}
+
+function normalizeVersion(raw: unknown): ProofVersion | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const data = raw as Record<string, unknown>;
+  const steps = Array.isArray(data.steps) ? data.steps.map(normalizeStep).filter((step): step is ProofStep => step !== null) : [];
+  return {
+    id: asText(data.id) || uid('version'),
+    name: asText(data.name, '未命名版本'),
+    createdAt: asText(data.createdAt, new Date().toISOString()),
+    steps,
+    goal: asText(data.goal),
+  };
+}
+
+function normalizeDocument(raw: unknown): ProofDocument | null {
+  if (!raw || typeof raw !== 'object') return null;
+  const data = raw as Record<string, unknown>;
+  const steps = Array.isArray(data.steps) ? data.steps.map(normalizeStep).filter((step): step is ProofStep => step !== null) : [];
+  const symbols = data.symbols && typeof data.symbols === 'object' ? (data.symbols as Record<string, unknown>) : {};
+  const versions = Array.isArray(data.versions) ? data.versions.map(normalizeVersion).filter((version): version is ProofVersion => version !== null) : [];
+  return {
+    id: asText(data.id) || uid('doc'),
+    title: asText(data.title, '未命名证明'),
+    author: asText(data.author, '本地用户'),
+    goal: asText(data.goal),
+    symbols: Object.fromEntries(Object.entries(symbols).map(([key, value]) => [key, asText(value)])),
+    steps,
+    versions,
+    updatedAt: asText(data.updatedAt, new Date().toISOString()),
+  };
+}
+
 function loadDocuments(): ProofDocument[] {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return initialDocuments();
-    const parsed = JSON.parse(raw) as ProofDocument[];
-    return Array.isArray(parsed) && parsed.length ? parsed : initialDocuments();
+    const parsed: unknown = JSON.parse(raw);
+    const documents = Array.isArray(parsed)
+      ? parsed.map(normalizeDocument).filter((document): document is ProofDocument => document !== null)
+      : [];
+    return documents.length ? documents : initialDocuments();
   } catch {
     return initialDocuments();
   }
@@ -245,8 +301,11 @@ function stripLatexCommands(text: string): string {
 export function validate(document: ProofDocument): ProofCheck[] {
   const checks: ProofCheck[] = [];
   const ids = new Set(document.steps.map((step) => step.id));
+  const positionById = new Map(document.steps.map((step, index) => [step.id, index]));
   const symbolKeys = new Set(Object.keys(document.symbols));
   const ignored = new Set(['a', 'A', 'b', 'B', 'n', 'k', 'P', 'Q', 'R', 'x', 'y', 'to', 'text', 'frac', 'sqrt']);
+  // 同一步对同一引用只报一次，避免失效引用与引用先后重复计数。
+  const flaggedPairs = new Set<string>();
 
   document.steps.forEach((step, index) => {
     const tokens = stripLatexCommands(step.statement).match(/\b[A-Za-z][A-Za-z0-9']*\b/g) ?? [];
@@ -256,8 +315,22 @@ export function validate(document: ProofDocument): ProofCheck[] {
     }
 
     step.references.forEach((reference) => {
+      const pairKey = `${step.id}->${reference}`;
+      if (flaggedPairs.has(pairKey)) return;
+      flaggedPairs.add(pairKey);
       if (!ids.has(reference)) {
-        checks.push({ id: `missing-${step.id}-${reference}`, severity: 'error', title: '引用步骤不存在', detail: `步骤 ${index + 1} 引用了已删除的步骤 ${reference}`, stepId: step.id });
+        checks.push({ id: `missing-${step.id}-${reference}`, severity: 'error', title: '引用步骤不存在', detail: `步骤 ${index + 1} 引用了已删除的步骤，依据已失效。`, stepId: step.id });
+        return;
+      }
+      const referenceIndex = positionById.get(reference) ?? -1;
+      if (referenceIndex >= index) {
+        checks.push({
+          id: `forward-${step.id}-${reference}`,
+          severity: 'error',
+          title: '引用了排在后面的步骤',
+          detail: `步骤 ${index + 1} 不能引用后面的步骤 ${referenceIndex + 1}（拖动排序后请重新核对引用先后）。`,
+          stepId: step.id,
+        });
       }
     });
   });
@@ -286,12 +359,73 @@ export function validate(document: ProofDocument): ProofCheck[] {
   const goalStep = document.steps.find((step) => step.type === 'goal' && step.rule === '结论');
   if (!goalStep) {
     checks.push({ id: 'goal-missing', severity: 'error', title: '目标未被证明', detail: '请添加“结论”类型的最终步骤。' });
-  } else if (goalStep.references.length === 0) {
-    checks.push({ id: 'goal-unlinked', severity: 'warning', title: '结论尚无推导支撑', detail: '最终步骤没有引用任何前置步骤。', stepId: goalStep.id });
+  } else {
+    const goalIndex = positionById.get(goalStep.id) ?? 0;
+
+    // 收集结论沿引用链实际依赖到的全部步骤（含指向后面或已删除的失效引用）。
+    const closure = new Set<string>();
+    const collect = (id: string): void => {
+      if (closure.has(id)) return;
+      closure.add(id);
+      const step = document.steps.find((item) => item.id === id);
+      step?.references.forEach(collect);
+    };
+    collect(goalStep.id);
+
+    // 逐层核对依据：前提本身有据；非前提步骤的每条引用都必须来自已落地的前序步骤。
+    const grounded = new Set<string>();
+    let progressed = true;
+    while (progressed) {
+      progressed = false;
+      closure.forEach((id) => {
+        if (grounded.has(id)) return;
+        const step = document.steps.find((item) => item.id === id);
+        if (!step) return;
+        const bases = step.references.filter((reference) => ids.has(reference) && (positionById.get(reference) ?? -1) < (positionById.get(id) ?? -1));
+        if (step.type === 'premise' || (bases.length > 0 && bases.every((reference) => grounded.has(reference)))) {
+          grounded.add(id);
+          progressed = true;
+        }
+      });
+    }
+
+    // 结论链上未落地的非前提步骤里，引用的前序步骤都已落地（或没有可用依据）者，就是断点本身。
+    const breaks = [...closure]
+      .filter((id) => !grounded.has(id))
+      .map((id) => document.steps.find((step) => step.id === id))
+      .filter((step): step is ProofStep => step !== undefined && step.type !== 'premise')
+      .filter((step) => {
+        const index = positionById.get(step.id) ?? 0;
+        return step.references
+          .filter((reference) => ids.has(reference) && (positionById.get(reference) ?? -1) < index)
+          .every((reference) => grounded.has(reference));
+      })
+      .sort((a, b) => (positionById.get(a.id) ?? 0) - (positionById.get(b.id) ?? 0));
+
+    if (!grounded.has(goalStep.id) && breaks.length) {
+      const labels = breaks.map((step) => `步骤 ${(positionById.get(step.id) ?? 0) + 1}`).join('、');
+      const goalBases = goalStep.references.filter((reference) => ids.has(reference) && (positionById.get(reference) ?? -1) < goalIndex);
+      const goalIsBreak = breaks.some((step) => step.id === goalStep.id);
+      let detail: string;
+      if (goalIsBreak && goalBases.length === 0) {
+        detail = `最终结论（步骤 ${goalIndex + 1}）没有引用任何前序步骤，结论缺少依据。`;
+      } else if (goalIsBreak) {
+        detail = `最终结论（步骤 ${goalIndex + 1}）引用的依据未连成完整推导链。`;
+      } else {
+        detail = `结论的引用链在 ${labels} 处中断：该步骤引用的依据无法继续回溯到前提。`;
+      }
+      checks.push({
+        id: 'goal-ungrounded',
+        severity: 'error',
+        title: goalIsBreak && goalBases.length === 0 ? '结论尚无推导支撑' : '结论依据链存在断点',
+        detail,
+        stepId: breaks[0]?.id ?? goalStep.id,
+      });
+    }
   }
 
   if (!checks.some((check) => check.severity === 'error')) {
-    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '未发现缺失引用、循环引用或未证明目标。' });
+    checks.push({ id: 'proof-ok', severity: 'info', title: '结构检查通过', detail: '引用均指向前面的步骤，且结论可沿引用链回溯到前提。' });
   }
   return checks;
 }
